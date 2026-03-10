@@ -1,0 +1,718 @@
+---
+title: "Mnemonic Similarity Task (MST) – Descriptive Statistics Analysis"
+author: "Sourav Nath, Piyush Agarwal, Rajarshi Chatterjee"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: cosmo
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5, dpi = 150)
+```
+
+# 1. Setup and Data Loading
+
+```{r libraries}
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+# Clear workspace
+rm(list = setdiff(ls(), lsf.str()))
+```
+
+## 1.1 Define Helper Functions
+
+```{r helper-functions}
+# Function to read all test files from a condition folder
+read_test_files <- function(data_dir, condition_name) {
+  # List all test CSV files
+  test_files <- list.files(data_dir, pattern = "MST_test.*\\.csv$", full.names = TRUE)
+  
+  all_data <- data.frame()
+  
+  for (f in test_files) {
+    # Extract participant ID from filename
+    participant_id <- sub("^(\\d+)_MST_test.*", "\\1", basename(f))
+    
+    df <- read.csv(f, stringsAsFactors = FALSE)
+    
+    # Keep only trial rows (rows with actual image_path and response)
+    # In test files, trial rows have non-empty key_resp_3.keys and image_path
+    trial_cols <- c("thisN", "key_resp_3.keys", "key_resp_3.rt", 
+                    "image_path", "position_of_stimuli")
+    
+    # Check which columns exist
+    existing_cols <- trial_cols[trial_cols %in% names(df)]
+    df_sub <- df[existing_cols]
+    
+    # Filter to actual trial rows
+    df_sub <- df_sub[!is.na(df_sub$image_path) & df_sub$image_path != "" &
+                     !is.na(df_sub$key_resp_3.keys) & df_sub$key_resp_3.keys != "", ]
+    
+    if (nrow(df_sub) > 0) {
+      df_sub$participant <- participant_id
+      df_sub$condition <- condition_name
+      all_data <- rbind(all_data, df_sub)
+    }
+  }
+  
+  return(all_data)
+}
+
+# Function to read bins file
+read_bins <- function(filepath) {
+  bins <- read.delim(filepath, header = FALSE, sep = "\t", 
+                     col.names = c("item_num", "bin"))
+  return(bins)
+}
+```
+
+## 1.2 Load Data from All Three Conditions
+
+```{r load-data}
+base_dir <- "MST_Data"
+
+# Load test data from all conditions
+item_only_data <- read_test_files(
+  file.path(base_dir, "item_only", "item_only_data"), "Item Only")
+task_only_data <- read_test_files(
+  file.path(base_dir, "task_only", "task_only_data"), "Task Only")
+both_data <- read_test_files(
+  file.path(base_dir, "Both_item_task", "both_data"), "Both")
+
+# Combine all data
+all_test_data <- rbind(item_only_data, task_only_data, both_data)
+
+# Convert response to factor
+all_test_data$response <- factor(all_test_data$key_resp_3.keys, 
+                                  levels = c("o", "s", "n"),
+                                  labels = c("Old", "Similar", "New"))
+
+# Convert reaction time to numeric
+all_test_data$rt <- as.numeric(all_test_data$key_resp_3.rt)
+
+# Classify stimulus type based on position_of_stimuli
+# pre, mid, post = Lure (similar items at different positions)
+# none = Foil (completely new)
+# For targets: items shown at encoding that appear again exactly
+# In this dataset: 'post' and 'pre' and 'mid' positions of lures
+# The position_of_stimuli indicates the type:
+#   - Items from Objects/Scenes folders with 'a' suffix shown at encoding = targets if shown again
+#   - Items with 'b' suffix = lures (similar versions)
+#   - Foils = brand new items from Foils folder
+
+all_test_data$stimulus_type <- ifelse(
+  grepl("^Foils", all_test_data$image_path), "Foil",
+  ifelse(grepl("b\\.", all_test_data$image_path), "Lure", "Target")
+)
+
+all_test_data$stimulus_type <- factor(all_test_data$stimulus_type, 
+                                      levels = c("Target", "Lure", "Foil"))
+
+# Convert condition to factor
+all_test_data$condition <- factor(all_test_data$condition, 
+                                  levels = c("Item Only", "Task Only", "Both"))
+
+cat("Total trials loaded:", nrow(all_test_data), "\n")
+cat("Participants per condition:\n")
+print(tapply(all_test_data$participant, all_test_data$condition, 
+             function(x) length(unique(x))))
+cat("\nTrials per stimulus type:\n")
+print(table(all_test_data$stimulus_type))
+```
+
+## 1.3 Load Similarity Bins
+
+```{r load-bins}
+# Load bins for Set6 (Objects)
+bins_set6 <- read_bins(file.path(base_dir, "item_only", "Set6 bins.txt"))
+bins_set6$set <- "Objects"
+
+# Load bins for SetScC (Scenes)
+bins_scc <- read_bins(file.path(base_dir, "item_only", "SetScC bins.txt"))
+bins_scc$set <- "Scenes"
+
+# Combine bins
+all_bins <- rbind(bins_set6, bins_scc)
+cat("Bins distribution:\n")
+print(table(all_bins$bin))
+```
+
+# 2. Compute Per-Participant Summary Metrics
+
+```{r compute-metrics}
+# For each participant, compute key metrics
+participant_metrics <- all_test_data %>%
+  group_by(participant, condition) %>%
+  summarise(
+    # Total trials by stimulus type
+    n_targets = sum(stimulus_type == "Target", na.rm = TRUE),
+    n_lures = sum(stimulus_type == "Lure", na.rm = TRUE),
+    n_foils = sum(stimulus_type == "Foil", na.rm = TRUE),
+    
+    # Hit Rate: P("Old" | Target)
+    hit_rate = sum(stimulus_type == "Target" & response == "Old", na.rm = TRUE) / 
+               sum(stimulus_type == "Target", na.rm = TRUE),
+    
+    # False Alarm Rate: P("Old" | Foil)
+    fa_rate = sum(stimulus_type == "Foil" & response == "Old", na.rm = TRUE) / 
+              sum(stimulus_type == "Foil", na.rm = TRUE),
+    
+    # Correct Rejection Rate: P("New" | Foil)
+    cr_rate = sum(stimulus_type == "Foil" & response == "New", na.rm = TRUE) / 
+              sum(stimulus_type == "Foil", na.rm = TRUE),
+    
+    # Lure Discrimination Index (LDI): P("Similar" | Lure) - P("Similar" | Foil)
+    p_sim_lure = sum(stimulus_type == "Lure" & response == "Similar", na.rm = TRUE) / 
+                 sum(stimulus_type == "Lure", na.rm = TRUE),
+    p_sim_foil = sum(stimulus_type == "Foil" & response == "Similar", na.rm = TRUE) / 
+                 sum(stimulus_type == "Foil", na.rm = TRUE),
+    LDI = p_sim_lure - p_sim_foil,
+    
+    # Recognition Memory (REC): P("Old" | Target) - P("Old" | Foil)
+    REC = hit_rate - fa_rate,
+    
+    # Mean Reaction Times
+    rt_targets = mean(rt[stimulus_type == "Target"], na.rm = TRUE),
+    rt_lures = mean(rt[stimulus_type == "Lure"], na.rm = TRUE),
+    rt_foils = mean(rt[stimulus_type == "Foil"], na.rm = TRUE),
+    rt_overall = mean(rt, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+cat("Participant metrics computed for", nrow(participant_metrics), "participants\n")
+```
+
+## 2.1 Summary Statistics Table
+
+```{r summary-table}
+# Compute group-level summary statistics
+summary_stats <- participant_metrics %>%
+  group_by(condition) %>%
+  summarise(
+    N = n(),
+    `Hit Rate (M)` = round(mean(hit_rate, na.rm = TRUE), 3),
+    `Hit Rate (SD)` = round(sd(hit_rate, na.rm = TRUE), 3),
+    `FA Rate (M)` = round(mean(fa_rate, na.rm = TRUE), 3),
+    `FA Rate (SD)` = round(sd(fa_rate, na.rm = TRUE), 3),
+    `LDI (M)` = round(mean(LDI, na.rm = TRUE), 3),
+    `LDI (SD)` = round(sd(LDI, na.rm = TRUE), 3),
+    `REC (M)` = round(mean(REC, na.rm = TRUE), 3),
+    `REC (SD)` = round(sd(REC, na.rm = TRUE), 3),
+    `CR Rate (M)` = round(mean(cr_rate, na.rm = TRUE), 3),
+    `CR Rate (SD)` = round(sd(cr_rate, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+kable(summary_stats, caption = "Table 1: Summary Statistics by Condition (Mean ± SD)")
+```
+
+# 3. Response Proportion Analysis
+
+```{r response-proportions}
+# Compute response proportions for each stimulus type × condition
+response_props <- all_test_data %>%
+  group_by(condition, stimulus_type, response) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(condition, stimulus_type) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+# Display as table
+response_table <- response_props %>%
+  select(condition, stimulus_type, response, proportion) %>%
+  pivot_wider(names_from = response, values_from = proportion, values_fill = 0) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+kable(response_table, caption = "Table 2: Response Proportions by Stimulus Type and Condition")
+```
+
+## 3.1 Figure 1: Response Proportions by Stimulus Type
+
+```{r fig1-response-proportions, fig.width=10, fig.height=6}
+ggplot(response_props, aes(x = stimulus_type, y = proportion, fill = response)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black", size = 0.3) +
+  facet_wrap(~ condition) +
+  scale_fill_manual(values = c("Old" = "#E74C3C", "Similar" = "#3498DB", "New" = "#2ECC71"),
+                    name = "Response") +
+  labs(title = "Figure 1: Response Proportions by Stimulus Type Across Conditions",
+       x = "Stimulus Type", y = "Proportion of Responses") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "bottom")
+
+ggsave("figures/fig1_response_proportions.png", width = 10, height = 6, dpi = 300)
+```
+
+# 4. Key Metrics Comparison Across Conditions
+
+## 4.1 Figure 2: LDI and REC Across Conditions
+
+```{r fig2-ldi-rec, fig.width=10, fig.height=5}
+# Prepare data for plotting
+metrics_long <- participant_metrics %>%
+  select(participant, condition, LDI, REC, hit_rate, fa_rate, cr_rate) %>%
+  pivot_longer(cols = c(LDI, REC, hit_rate, fa_rate, cr_rate),
+               names_to = "metric", values_to = "value")
+
+# LDI and REC boxplots
+ldi_rec_data <- metrics_long %>%
+  filter(metric %in% c("LDI", "REC"))
+
+ggplot(ldi_rec_data, aes(x = condition, y = value, fill = condition)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  geom_jitter(width = 0.15, alpha = 0.3, size = 1.5) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_manual(values = c("Item Only" = "#9B59B6", 
+                                "Task Only" = "#E67E22", 
+                                "Both" = "#1ABC9C")) +
+  labs(title = "Figure 2: Lure Discrimination Index (LDI) and Recognition (REC) by Condition",
+       x = "Condition", y = "Score") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "none")
+
+ggsave("figures/fig2_ldi_rec_boxplot.png", width = 10, height = 5, dpi = 300)
+```
+
+## 4.2 Figure 3: Hit Rate and False Alarm Rate
+
+```{r fig3-hit-fa, fig.width=10, fig.height=5}
+hit_fa_data <- metrics_long %>%
+  filter(metric %in% c("hit_rate", "fa_rate")) %>%
+  mutate(metric = recode(metric, 
+                         "hit_rate" = "Hit Rate", 
+                         "fa_rate" = "False Alarm Rate"))
+
+ggplot(hit_fa_data, aes(x = condition, y = value, fill = condition)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  geom_jitter(width = 0.15, alpha = 0.3, size = 1.5) +
+  facet_wrap(~ metric) +
+  scale_fill_manual(values = c("Item Only" = "#9B59B6", 
+                                "Task Only" = "#E67E22", 
+                                "Both" = "#1ABC9C")) +
+  labs(title = "Figure 3: Hit Rate and False Alarm Rate by Condition",
+       x = "Condition", y = "Rate") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "none")
+
+ggsave("figures/fig3_hit_fa_boxplot.png", width = 10, height = 5, dpi = 300)
+```
+
+# 5. Distribution Analysis
+
+## 5.1 Figure 4: Distribution of LDI Scores
+
+```{r fig4-ldi-distribution, fig.width=10, fig.height=5}
+# Histogram with overlaid normal curve
+ggplot(participant_metrics, aes(x = LDI)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 20, 
+                 fill = "#3498DB", color = "white", alpha = 0.7) +
+  geom_density(color = "#E74C3C", linewidth = 1.2) +
+  facet_wrap(~ condition) +
+  labs(title = "Figure 4: Distribution of Lure Discrimination Index (LDI) by Condition",
+       x = "LDI Score", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12))
+
+ggsave("figures/fig4_ldi_distribution.png", width = 10, height = 5, dpi = 300)
+```
+
+## 5.2 Normal Distribution and t-Distribution Fitting
+
+```{r distribution-fitting}
+# For each condition, compare LDI distribution to normal and t-distribution
+cat("=== Shapiro-Wilk Normality Tests for LDI ===\n\n")
+
+for (cond in levels(participant_metrics$condition)) {
+  ldi_vals <- participant_metrics$LDI[participant_metrics$condition == cond]
+  ldi_vals <- ldi_vals[!is.na(ldi_vals)]
+  
+  cat(paste0("Condition: ", cond, "\n"))
+  cat(paste0("  N = ", length(ldi_vals), "\n"))
+  cat(paste0("  Mean = ", round(mean(ldi_vals), 4), "\n"))
+  cat(paste0("  SD = ", round(sd(ldi_vals), 4), "\n"))
+  cat(paste0("  Skewness = ", round(moments::skewness(ldi_vals), 4), "\n"))
+  cat(paste0("  Kurtosis = ", round(moments::kurtosis(ldi_vals), 4), "\n"))
+  
+  sw_test <- shapiro.test(ldi_vals)
+  cat(paste0("  Shapiro-Wilk W = ", round(sw_test$statistic, 4), 
+             ", p = ", round(sw_test$p.value, 4), "\n\n"))
+}
+```
+
+```{r fig5-normal-t-comparison, fig.width=10, fig.height=5}
+# Compare Normal vs t-distribution fit for LDI scores
+plot_data <- data.frame()
+
+for (cond in levels(participant_metrics$condition)) {
+  ldi_vals <- participant_metrics$LDI[participant_metrics$condition == cond]
+  ldi_vals <- ldi_vals[!is.na(ldi_vals)]
+  
+  m <- mean(ldi_vals)
+  s <- sd(ldi_vals)
+  n <- length(ldi_vals)
+  
+  x_seq <- seq(min(ldi_vals) - 0.1, max(ldi_vals) + 0.1, length.out = 200)
+  
+  # Normal density
+  normal_density <- dnorm(x_seq, mean = m, sd = s)
+  
+  # t-distribution density (scaled) with n-1 degrees of freedom
+  t_density <- dt((x_seq - m) / s, df = n - 1) / s
+  
+  temp <- data.frame(
+    x = rep(x_seq, 2),
+    density = c(normal_density, t_density),
+    distribution = rep(c("Normal", "t-Distribution"), each = length(x_seq)),
+    condition = cond
+  )
+  plot_data <- rbind(plot_data, temp)
+}
+
+ggplot() +
+  geom_histogram(data = participant_metrics, 
+                 aes(x = LDI, y = after_stat(density)), 
+                 bins = 15, fill = "grey80", color = "white", alpha = 0.6) +
+  geom_line(data = plot_data, 
+            aes(x = x, y = density, color = distribution, linetype = distribution),
+            linewidth = 1.1) +
+  facet_wrap(~ condition) +
+  scale_color_manual(values = c("Normal" = "#E74C3C", "t-Distribution" = "#2980B9"),
+                     name = "Distribution") +
+  scale_linetype_manual(values = c("Normal" = "solid", "t-Distribution" = "dashed"),
+                        name = "Distribution") +
+  labs(title = "Figure 5: LDI Distribution with Normal and t-Distribution Overlay",
+       x = "LDI Score", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "bottom")
+
+ggsave("figures/fig5_normal_t_comparison.png", width = 10, height = 5, dpi = 300)
+```
+
+## 5.3 One-Sample t-Tests (Descriptive)
+
+```{r t-tests}
+# Test whether LDI is significantly different from 0 (chance) for each condition
+cat("=== One-Sample t-Tests: Is LDI significantly > 0? ===\n\n")
+
+for (cond in levels(participant_metrics$condition)) {
+  ldi_vals <- participant_metrics$LDI[participant_metrics$condition == cond]
+  ldi_vals <- ldi_vals[!is.na(ldi_vals)]
+  
+  t_result <- t.test(ldi_vals, mu = 0, alternative = "greater")
+  
+  cat(paste0("Condition: ", cond, "\n"))
+  cat(paste0("  Mean LDI = ", round(t_result$estimate, 4), "\n"))
+  cat(paste0("  t(", t_result$parameter, ") = ", round(t_result$statistic, 4), "\n"))
+  cat(paste0("  p-value = ", format(t_result$p.value, scientific = TRUE, digits = 4), "\n"))
+  cat(paste0("  95% CI: [", round(t_result$conf.int[1], 4), ", Inf]\n"))
+  
+  # Cohen's d
+  cohens_d <- mean(ldi_vals) / sd(ldi_vals)
+  cat(paste0("  Cohen's d = ", round(cohens_d, 4), "\n\n"))
+}
+
+# Same for REC
+cat("=== One-Sample t-Tests: Is REC significantly > 0? ===\n\n")
+
+for (cond in levels(participant_metrics$condition)) {
+  rec_vals <- participant_metrics$REC[participant_metrics$condition == cond]
+  rec_vals <- rec_vals[!is.na(rec_vals)]
+  
+  t_result <- t.test(rec_vals, mu = 0, alternative = "greater")
+  
+  cat(paste0("Condition: ", cond, "\n"))
+  cat(paste0("  Mean REC = ", round(t_result$estimate, 4), "\n"))
+  cat(paste0("  t(", t_result$parameter, ") = ", round(t_result$statistic, 4), "\n"))
+  cat(paste0("  p-value = ", format(t_result$p.value, scientific = TRUE, digits = 4), "\n"))
+  cat(paste0("  95% CI: [", round(t_result$conf.int[1], 4), ", Inf]\n\n"))
+}
+```
+
+# 6. Reaction Time Analysis
+
+```{r rt-summary}
+# RT summary statistics
+rt_summary <- all_test_data %>%
+  filter(!is.na(rt) & rt > 0) %>%
+  group_by(condition, stimulus_type) %>%
+  summarise(
+    Mean_RT = round(mean(rt, na.rm = TRUE), 3),
+    SD_RT = round(sd(rt, na.rm = TRUE), 3),
+    Median_RT = round(median(rt, na.rm = TRUE), 3),
+    N = n(),
+    .groups = "drop"
+  )
+
+kable(rt_summary, caption = "Table 3: Reaction Time (seconds) by Condition and Stimulus Type")
+```
+
+## 6.1 Figure 6: Reaction Times by Stimulus Type
+
+```{r fig6-rt, fig.width=10, fig.height=5}
+rt_data <- all_test_data %>%
+  filter(!is.na(rt) & rt > 0 & rt < quantile(rt, 0.99, na.rm = TRUE))
+
+ggplot(rt_data, aes(x = stimulus_type, y = rt, fill = stimulus_type)) +
+  geom_violin(alpha = 0.6, trim = TRUE) +
+  geom_boxplot(width = 0.15, alpha = 0.8, outlier.size = 0.5) +
+  facet_wrap(~ condition) +
+  scale_fill_manual(values = c("Target" = "#E74C3C", 
+                                "Lure" = "#F39C12", 
+                                "Foil" = "#27AE60")) +
+  labs(title = "Figure 6: Reaction Time Distributions by Stimulus Type and Condition",
+       x = "Stimulus Type", y = "Reaction Time (seconds)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "none")
+
+ggsave("figures/fig6_rt_violin.png", width = 10, height = 5, dpi = 300)
+```
+
+## 6.2 Figure 7: Mean RT by Response Type
+
+```{r fig7-rt-response, fig.width=10, fig.height=5}
+rt_by_response <- all_test_data %>%
+  filter(!is.na(rt) & rt > 0 & !is.na(response)) %>%
+  group_by(condition, response) %>%
+  summarise(
+    mean_rt = mean(rt, na.rm = TRUE),
+    se_rt = sd(rt, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(rt_by_response, aes(x = response, y = mean_rt, fill = condition)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black", size = 0.3) +
+  geom_errorbar(aes(ymin = mean_rt - se_rt, ymax = mean_rt + se_rt),
+                position = position_dodge(0.9), width = 0.2) +
+  scale_fill_manual(values = c("Item Only" = "#9B59B6", 
+                                "Task Only" = "#E67E22", 
+                                "Both" = "#1ABC9C")) +
+  labs(title = "Figure 7: Mean Reaction Time by Response Type Across Conditions",
+       x = "Response", y = "Mean RT (seconds)",
+       fill = "Condition") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "bottom")
+
+ggsave("figures/fig7_rt_by_response.png", width = 10, height = 5, dpi = 300)
+```
+
+# 7. Similarity Bin Analysis
+
+```{r bin-analysis}
+# Extract item number from image path for lure items
+# Lure items have 'b' suffix: e.g., Objects\039b.jpg -> item 39
+lure_data <- all_test_data %>%
+  filter(stimulus_type == "Lure") %>%
+  mutate(
+    # Extract the number from the image path
+    item_num_str = sub(".*[/\\\\](\\d+)b\\.jpg$", "\\1", image_path),
+    item_num = as.integer(item_num_str),
+    # Determine if object or scene
+    stim_set = ifelse(grepl("^Objects", image_path), "Objects", "Scenes")
+  ) %>%
+  filter(!is.na(item_num))
+
+# Merge with bins
+# For Objects: use bins_set6, for Scenes: use bins_scc  
+lure_with_bins <- lure_data %>%
+  left_join(
+    rbind(
+      bins_set6 %>% mutate(stim_set = "Objects"),
+      bins_scc %>% mutate(stim_set = "Scenes")
+    ),
+    by = c("item_num" = "item_num", "stim_set" = "stim_set")
+  ) %>%
+  filter(!is.na(bin))
+
+# Compute LDI-like metric by bin  
+bin_performance <- lure_with_bins %>%
+  group_by(condition, bin) %>%
+  summarise(
+    n_trials = n(),
+    p_old = mean(response == "Old", na.rm = TRUE),
+    p_similar = mean(response == "Similar", na.rm = TRUE),
+    p_new = mean(response == "New", na.rm = TRUE),
+    mean_rt = mean(rt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Table
+kable(bin_performance %>% mutate(across(where(is.numeric), ~ round(., 3))),
+      caption = "Table 4: Lure Performance by Similarity Bin (1=most similar, 5=least similar)")
+```
+
+## 7.1 Figure 8: Lure Performance by Similarity Bin
+
+```{r fig8-bin-performance, fig.width=10, fig.height=6}
+bin_props <- lure_with_bins %>%
+  group_by(condition, bin, response) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(condition, bin) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup() %>%
+  mutate(bin = factor(bin, labels = paste("Bin", 1:5)))
+
+ggplot(bin_props, aes(x = bin, y = proportion, fill = response)) +
+  geom_bar(stat = "identity", position = "stack", color = "black", size = 0.2) +
+  facet_wrap(~ condition) +
+  scale_fill_manual(values = c("Old" = "#E74C3C", "Similar" = "#3498DB", "New" = "#2ECC71"),
+                    name = "Response") +
+  labs(title = "Figure 8: Response Proportions for Lures by Similarity Bin",
+       subtitle = "Bin 1 = most similar to target, Bin 5 = least similar",
+       x = "Similarity Bin", y = "Proportion of Responses") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 11, color = "grey40"),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "bottom")
+
+ggsave("figures/fig8_bin_performance.png", width = 10, height = 6, dpi = 300)
+```
+
+# 8. Lure Position Analysis (pre, mid, post)
+
+```{r pos-analysis}
+# Filter for lure items that have a specific position (pre, mid, post)
+lure_pos_data <- all_test_data %>%
+  filter(stimulus_type == "Lure" & position_of_stimuli %in% c("pre", "mid", "post"))
+
+# Compute performance by position
+pos_performance <- lure_pos_data %>%
+  group_by(condition, position_of_stimuli) %>%
+  summarise(
+    n_trials = n(),
+    p_old = mean(response == "Old", na.rm = TRUE),
+    p_similar = mean(response == "Similar", na.rm = TRUE),
+    p_new = mean(response == "New", na.rm = TRUE),
+    mean_rt = mean(rt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Table
+kable(pos_performance %>% mutate(across(where(is.numeric), ~ round(., 3))),
+      caption = "Table 5: Lure Performance by Position of Stimuli (pre, mid, post)")
+```
+
+## 8.1 Figure 10: Lure Performance by Position
+
+```{r fig10-pos-performance, fig.width=10, fig.height=6}
+pos_props <- lure_pos_data %>%
+  group_by(condition, position_of_stimuli, response) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(condition, position_of_stimuli) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup() %>%
+  mutate(position_of_stimuli = factor(position_of_stimuli, levels = c("pre", "mid", "post")))
+
+ggplot(pos_props, aes(x = position_of_stimuli, y = proportion, fill = response)) +
+  geom_bar(stat = "identity", position = "stack", color = "black", size = 0.2) +
+  facet_wrap(~ condition) +
+  scale_fill_manual(values = c("Old" = "#E74C3C", "Similar" = "#3498DB", "New" = "#2ECC71"),
+                    name = "Response") +
+  labs(title = "Figure 10: Response Proportions for Lures by Position",
+       x = "Position of Stimuli", y = "Proportion of Responses") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "bottom")
+
+ggsave("figures/fig10_pos_performance.png", width = 10, height = 6, dpi = 300)
+```
+
+# 9. Additional Descriptive Statistics
+
+## 9.1 Overall Accuracy
+
+```{r overall-accuracy}
+# Compute overall accuracy: correct responses for each stimulus type
+# Target → "Old", Lure → "Similar", Foil → "New"
+all_test_data$correct <- with(all_test_data, 
+  (stimulus_type == "Target" & response == "Old") |
+  (stimulus_type == "Lure" & response == "Similar") |
+  (stimulus_type == "Foil" & response == "New")
+)
+
+accuracy_by_condition <- all_test_data %>%
+  group_by(condition) %>%
+  summarise(
+    overall_accuracy = round(mean(correct, na.rm = TRUE), 3),
+    target_accuracy = round(mean(correct[stimulus_type == "Target"], na.rm = TRUE), 3),
+    lure_accuracy = round(mean(correct[stimulus_type == "Lure"], na.rm = TRUE), 3),
+    foil_accuracy = round(mean(correct[stimulus_type == "Foil"], na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+kable(accuracy_by_condition, 
+      caption = "Table 6: Accuracy Rates by Condition",
+      col.names = c("Condition", "Overall", "Target", "Lure", "Foil"))
+```
+
+## 9.2 Participant-Level Variability
+
+```{r fig11-participant-variability, fig.width=10, fig.height=5}
+# Scatter plot: Hit Rate vs LDI colored by condition
+ggplot(participant_metrics, aes(x = hit_rate, y = LDI, color = condition)) +
+  geom_point(size = 2.5, alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.15, linewidth = 1) +
+  scale_color_manual(values = c("Item Only" = "#9B59B6", 
+                                 "Task Only" = "#E67E22", 
+                                 "Both" = "#1ABC9C")) +
+  labs(title = "Figure 11: Relationship Between Hit Rate and Lure Discrimination (LDI)",
+       x = "Hit Rate (Target Recognition)", y = "Lure Discrimination Index (LDI)",
+       color = "Condition") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "bottom")
+
+ggsave("figures/fig11_hit_vs_ldi.png", width = 10, height = 5, dpi = 300)
+```
+
+# 10. Summary of Key Findings
+
+```{r summary}
+cat("====================================================\n")
+cat("       SUMMARY OF DESCRIPTIVE STATISTICS             \n")
+cat("====================================================\n\n")
+
+for (cond in levels(participant_metrics$condition)) {
+  d <- participant_metrics[participant_metrics$condition == cond, ]
+  cat(paste0("--- ", cond, " Condition ---\n"))
+  cat(paste0("  N participants: ", nrow(d), "\n"))
+  cat(paste0("  Hit Rate: ", round(mean(d$hit_rate, na.rm=T), 3), 
+             " ± ", round(sd(d$hit_rate, na.rm=T), 3), "\n"))
+  cat(paste0("  FA Rate:  ", round(mean(d$fa_rate, na.rm=T), 3), 
+             " ± ", round(sd(d$fa_rate, na.rm=T), 3), "\n"))
+  cat(paste0("  LDI:      ", round(mean(d$LDI, na.rm=T), 3), 
+             " ± ", round(sd(d$LDI, na.rm=T), 3), "\n"))
+  cat(paste0("  REC:      ", round(mean(d$REC, na.rm=T), 3), 
+             " ± ", round(sd(d$REC, na.rm=T), 3), "\n"))
+  cat(paste0("  Mean RT:  ", round(mean(d$rt_overall, na.rm=T), 3), 
+             " ± ", round(sd(d$rt_overall, na.rm=T), 3), " sec\n\n"))
+}
+```
+
+```{r session-info}
+sessionInfo()
+```
